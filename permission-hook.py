@@ -4,31 +4,21 @@
 自动放行绝大多数操作，仅对计划文件编辑弹窗确认。
 配合 settings.json 的 allowlist 使用：allowlist 中的条目不会触发此钩子。
 
-安装：在 ~/.claude/settings.json 或项目 .claude/settings.json 中配置：
-{
-  "hooks": {
-    "PermissionRequest": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /path/to/permission-hook.py"
-          }
-        ]
-      }
-    ]
-  }
-}
+支持 macOS (AppleScript dialog) 和 Windows (ctypes MessageBox)。
 """
 
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
-LOG = "/tmp/claude-permission-hook.log"
-SOUND = "/System/Library/Sounds/Glass.aiff"
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
+
+LOG_DIR = tempfile.gettempdir()
+LOG = os.path.join(LOG_DIR, "claude-permission-hook.log")
 DIALOG_TIMEOUT = 120
 
 # 这些工具的操作基本安全，一律自动放行
@@ -62,39 +52,73 @@ def log(msg):
         pass
 
 
-def activate_ghostty():
+# ── 平台抽象层 ──────────────────────────────────────────────
+
+def play_sound():
+    """播放提示音。"""
+    if IS_MAC:
+        try:
+            subprocess.Popen(
+                ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    elif IS_WIN:
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
+
+
+def send_notification(title, text):
+    """发送系统通知（弹窗失败时的降级方案）。"""
+    if IS_MAC:
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{text}" with title "{title}" sound name "Glass"'],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+    elif IS_WIN:
+        try:
+            from win10toast import ToastNotifier
+            ToastNotifier().show_toast(title, text, duration=5, threaded=True)
+        except Exception:
+            pass
+
+
+def activate_terminal():
+    """把终端窗口带到前台。"""
+    if IS_MAC:
+        try:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "Ghostty" to activate'],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+    elif IS_WIN:
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+
+# ── 弹窗 ────────────────────────────────────────────────────
+
+def _dialog_mac(msg):
+    """macOS: AppleScript dialog，三按钮 + 超时。"""
+    fd, msg_file = tempfile.mkstemp(prefix=".claude_hook_msg_", suffix=".txt")
     try:
-        subprocess.run(
-            ["osascript", "-e", 'tell application "Ghostty" to activate'],
-            capture_output=True, timeout=5,
-        )
-    except Exception:
-        pass
-
-
-def build_message(tool, inp, cwd):
-    parts = [f"工具: {tool}"]
-    if tool == "Bash":
-        detail = inp.get("command", "")[:200]
-        if detail:
-            parts.append(f"命令: {detail}")
-    elif tool in ("Edit", "Write", "Read"):
-        detail = inp.get("file_path", "")
-        if detail:
-            parts.append(f"文件: {detail}")
-    elif tool == "Agent":
-        detail = inp.get("description", "")
-        if detail:
-            parts.append(f"任务: {detail}")
-    if cwd:
-        parts.append(f"目录: {cwd}")
-    return "\n".join(parts)
-
-
-def show_dialog(msg):
-    msg_file = f"/tmp/.claude_hook_msg_{os.getpid()}"
-    try:
-        with open(msg_file, "w") as f:
+        with os.fdopen(fd, "w") as f:
             f.write(msg)
     except Exception:
         return ""
@@ -123,22 +147,55 @@ end try
         log("Dialog timed out")
     except Exception as e:
         log(f"Dialog error: {e}")
-        try:
-            subprocess.run(
-                ["osascript", "-e",
-                 'display notification "Claude Code 需要你的授权"'
-                 ' with title "Claude Code" sound name "Glass"'],
-                capture_output=True, timeout=5,
-            )
-        except Exception:
-            pass
+        send_notification("Claude Code", "需要你的授权")
 
     try:
         os.unlink(msg_file)
     except Exception:
         pass
-
     return result
+
+
+def _dialog_win(msg):
+    """Windows: ctypes MessageBox，三按钮（Abort/Retry/Ignore 映射为 拒绝/查看详情/授权）。"""
+    import ctypes
+    # MB_ABORTRETRYIGNORE = 2, MB_ICONQUESTION = 32, MB_SYSTEMMODAL = 0x1000
+    flags = 2 | 32 | 0x1000
+    rc = ctypes.windll.user32.MessageBoxW(
+        0, msg, "Claude Code 需要授权", flags
+    )
+    # IDABORT=3 → 拒绝, IDRETRY=4 → 查看详情, IDIGNORE=5 → 授权
+    return {3: "拒绝", 4: "查看详情", 5: "授权"}.get(rc, "")
+
+
+def show_dialog(msg):
+    """显示确认弹窗，返回结果字符串。"""
+    if IS_MAC:
+        return _dialog_mac(msg)
+    elif IS_WIN:
+        return _dialog_win(msg)
+    return ""
+
+
+# ── 消息组装 ────────────────────────────────────────────────
+
+def build_message(tool, inp, cwd):
+    parts = [f"工具: {tool}"]
+    if tool == "Bash":
+        detail = inp.get("command", "")[:200]
+        if detail:
+            parts.append(f"命令: {detail}")
+    elif tool in ("Edit", "Write", "Read"):
+        detail = inp.get("file_path", "")
+        if detail:
+            parts.append(f"文件: {detail}")
+    elif tool == "Agent":
+        detail = inp.get("description", "")
+        if detail:
+            parts.append(f"任务: {detail}")
+    if cwd:
+        parts.append(f"目录: {cwd}")
+    return "\n".join(parts)
 
 
 def is_plan_file(file_path):
@@ -150,9 +207,8 @@ def is_plan_file(file_path):
     return has_plan_dir and has_indicator
 
 
-# 只读 Bash 命令前缀 — 子代理频繁使用，不需要弹窗
-# 格式：(前缀, 是否需要精确匹配命令名)
-# 注意：这里只放安全的只读命令，不含任何写入/删除/执行操作
+# ── 只读 Bash 命令前缀 ─────────────────────────────────────
+
 READONLY_BASH_PREFIXES = (
     # 文件内容搜索 — 只读
     "grep ",
@@ -316,12 +372,13 @@ DANGEROUS_KEYWORDS = (
 )
 
 
+# ── 命令解析 ────────────────────────────────────────────────
+
 def _split_pipes(cmd):
     """按管道符 | 拆分命令，但尊重引号内的 | 不拆分。
 
     解决核心问题：grep 正则中的 \\|（OR 操作符）在单引号内，
     naive split("|") 会误拆，导致只读命令被判定为不安全。
-    例如：grep -v '\\.onReceive\\|notifyDataChange' 会被错误拆成三段。
     """
     segments = []
     current = []
@@ -335,7 +392,6 @@ def _split_pipes(cmd):
             current.append(c)
             escaped = False
         elif c == '\\' and not in_single:
-            # 反斜杠在单引号内无特殊含义，保持原样
             escaped = True
             current.append(c)
         elif c == "'" and not in_double:
@@ -358,12 +414,11 @@ def _split_pipes(cmd):
 def _strip_cd_prefix(cmd):
     """去掉 cd 前缀（子代理常用 "cd /path && command" 形式）。
     支持多层 cd ... && cd ... && command。
-    返回去掉 cd 前缀后的命令；如果没有 cd 前缀则原样返回。
     """
     while cmd.startswith("cd "):
         and_pos = cmd.find(" && ")
         if and_pos == -1:
-            break  # 纯 cd，没有后续命令
+            break
         cmd = cmd[and_pos + 4:].strip()
     return cmd
 
@@ -382,16 +437,11 @@ def _strip_env_prefix(seg):
 
 
 def is_known_safe(cmd):
-    """判断 cd 前缀后的命令是否在 KNOWN_SAFE_COMMANDS 中。
-    这是 settings.json allowlist 的兜底：子代理用 cd ... && 时，
-    settings.json 的 Bash(xcodebuild *) 匹配不到 cd 开头的命令，
-    所以在这里补一层。
-    """
+    """判断 cd 前缀后的命令是否在 KNOWN_SAFE_COMMANDS 中。"""
     stripped = _strip_cd_prefix(cmd)
     if stripped == cmd and not cmd.startswith("cd "):
-        return False  # 没有 cd 前缀，这个函数不负责
+        return False
 
-    # 取第一段命令（到第一个 && 或 | 或 ; 为止）
     first_seg = stripped.split("&&")[0].split("|")[0].split(";")[0].strip()
     first_seg = _strip_env_prefix(first_seg)
     first_token = first_seg.split()[0] if first_seg.split() else ""
@@ -414,17 +464,14 @@ def is_readonly_bash(cmd):
     if not cmd:
         return False
 
-    # 排除危险操作
     for kw in DANGEROUS_KEYWORDS:
         if kw in cmd:
             return False
 
-    # 去掉 cd 前缀
     cmd = _strip_cd_prefix(cmd)
     if cmd.startswith("cd "):
-        return False  # 去不掉的纯 cd
+        return False
 
-    # 按管道拆分（引号感知），每段都要是只读的
     segments = _split_pipes(cmd)
     for seg in segments:
         seg = seg.strip()
@@ -434,8 +481,6 @@ def is_readonly_bash(cmd):
         if not seg:
             continue
 
-        # 用 seg 整体匹配前缀（带参数的命令如 "grep -rn ..."）
-        # 或用 seg + " " 匹配（纯命令名如 "sort" 匹配 "sort "）
         matched = False
         for prefix in READONLY_BASH_PREFIXES:
             if seg.startswith(prefix) or (seg + " ").startswith(prefix):
@@ -454,24 +499,20 @@ def auto_allow(tool, inp):
     - 只读/内部工具 → 一律放行
     - Edit/Write 非计划文件 → 放行
     - Edit/Write 计划文件 → 弹窗确认
-    - Bash 只读命令 → 放行（覆盖子代理常用的 grep/find 等）
+    - Bash 只读命令 → 放行
     - Bash 写入/未知命令 → 弹窗确认
     - 其他未知工具 → 弹窗确认
     """
-    # 只读和内部工具一律放行
     if tool in SAFE_TOOLS:
         return True
 
-    # MCP 工具一律放行（已在 allowlist 中按需授权）
     if tool.startswith("mcp__"):
         return True
 
-    # Edit/Write：非计划文件放行，计划文件需确认
     if tool in ("Edit", "Write"):
         file_path = inp.get("file_path", "")
         return not is_plan_file(file_path)
 
-    # Bash：只读命令或已知安全命令自动放行，其他需确认
     if tool == "Bash":
         cmd = inp.get("command", "")
         if is_readonly_bash(cmd):
@@ -481,6 +522,8 @@ def auto_allow(tool, inp):
 
     return False
 
+
+# ── 主入口 ──────────────────────────────────────────────────
 
 def main():
     try:
@@ -493,7 +536,6 @@ def main():
     inp = data.get("tool_input", {})
     cwd = data.get("cwd", "")
 
-    # 统一记录请求详情（无论是否自动放行）
     detail = ""
     if tool in ("Edit", "Write"):
         detail = inp.get("file_path", "")
@@ -514,15 +556,7 @@ def main():
 
     # 需要用户确认的操作 — 弹窗
     msg = build_message(tool, inp, cwd)
-
-    try:
-        subprocess.Popen(
-            ["afplay", SOUND],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
+    play_sound()
     result = show_dialog(msg)
     log(f"Result: {result}")
 
@@ -537,7 +571,7 @@ def main():
         print(json.dumps(resp))
     elif "查看详情" in result:
         log("-> View details")
-        activate_ghostty()
+        activate_terminal()
     elif "拒绝" in result:
         log("-> Denied")
         resp = {
@@ -548,8 +582,8 @@ def main():
         }
         print(json.dumps(resp))
     else:
-        log("-> No decision, activating Ghostty")
-        activate_ghostty()
+        log("-> No decision, activating terminal")
+        activate_terminal()
 
     sys.exit(0)
 
