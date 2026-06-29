@@ -1,0 +1,10 @@
+# 危险操作黑名单 —— 命中即拦截，即便命令误加进可信清单或静态 allow list 也挡住
+# 这是兜底保险，宁可拦错也不放过。
+
+rm -rf /
+git push .*--force
+git push -f origin (main|master)
+DROP (TABLE|DATABASE)
+> */etc/
+chmod -R 777 /
+:(){ :|:& };:

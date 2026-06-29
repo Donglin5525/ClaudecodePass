@@ -1,0 +1,16 @@
+# 可信命令清单 —— 每行一条正则，命中即自动放行（不弹窗）
+# 新命令冒出来弹窗时，加一行正则即可，立即生效。
+# 注释行以 # 开头。
+
+# Swift 编译器（swiftc ≠ swift，静态白名单的 swift * 匹配不到）
+^swiftc\b
+
+# 部署 HoloBackend 到 ECS（限定到 123.56.104.9，含带 -o 选项的形式）
+^ssh (root@123\.56\.104\.9|-o .* root@123\.56\.104\.9)\b
+
+# 文件同步 / 上传
+^rsync\b
+^scp\b
+
+# 本地 docker（compose/build/查询）
+^docker (compose|build|ps|logs|images)\b
