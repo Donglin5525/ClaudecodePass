@@ -130,7 +130,7 @@ try
     display dialog msg ¬
         with title "Claude Code 需要授权" ¬
         buttons {{"拒绝", "查看详情", "授权"}} ¬
-        default button "授权" ¬
+        default button "拒绝" ¬
         giving up after {DIALOG_TIMEOUT}
 on error number -128
     return "cancelled"
@@ -481,9 +481,13 @@ def is_readonly_bash(cmd):
         if not seg:
             continue
 
+        # xargs 后接只读命令也算只读（find ... | xargs grep 这类常见组合）
+        # xargs rm 因 rm 不在只读清单而不会放行 —— 安全优先
+        check_seg = seg[6:].strip() if seg.startswith("xargs ") else seg
+
         matched = False
         for prefix in READONLY_BASH_PREFIXES:
-            if seg.startswith(prefix) or (seg + " ").startswith(prefix):
+            if check_seg.startswith(prefix) or (check_seg + " ").startswith(prefix):
                 matched = True
                 break
         if not matched:
@@ -582,8 +586,12 @@ def main():
         }
         print(json.dumps(resp))
     else:
-        log("-> No decision, activating terminal")
+        # 浮窗超时或异常关闭 —— 绝不替用户放行（堵死"没看到就默认同意"）
+        # 也不直接 deny（deny=操作失败要重发，不符合"停下来等我"）
+        # 不输出 decision → 回退终端原生权限弹窗，持续等用户，不超时、不放行
+        log("-> Timeout/abnormal, NOT allowing; falling back to terminal")
         activate_terminal()
+        send_notification("Claude Code 等待确认", "有操作等你确认，已切回终端，请回终端处理")
 
     sys.exit(0)
 
